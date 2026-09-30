@@ -20,43 +20,47 @@
 ## 🏗️ Architecture & Mechanism
 
 ```
-                   +-----------------------------------------------+
-                   |                ATHLETE / USER                 |
-                   +-----------------------------------------------+
-                                          |
-                      1. create_challenge (pledge stake in GEN)
-                                          v
-                   +-----------------------------------------------+
-                   |        PaceStake Intelligent Contract         |
-                   |           (Status: ACTIVE, Escrowed)          |
-                   +-----------------------------------------------+
-                                          |
-                      2. submit_proof (public Strava/Garmin URL)
-                                          v
-                   +-----------------------------------------------+
-                   |        PaceStake Intelligent Contract         |
-                   |          (Status: EVIDENCE_SUBMITTED)         |
-                   +-----------------------------------------------+
-                                          |
-                      3. adjudicate_challenge()
-                                          v
-      +-----------------------------------------------------------------------+
-      |               Decentralized AI Jury Consensus (GenVM)                 |
-      |                                                                       |
-      |  Leader & Validators run independently:                               |
-      |  - gl.nondet.web.render(url, mode="text")                             |
-      |  - Strict LLM Security & Metric Audit prompt                          |
-      |  - Compare SEMANTIC VERDICT: ACHIEVED vs FAILED                       |
-      +-----------------------------------------------------------------------+
-                     /                                         \
-        VERDICT: "ACHIEVED"                               VERDICT: "FAILED"
-                    /                                           \
-                   v                                             v
-  +---------------------------------+           +---------------------------------+
-  |        Status: COMPLETED        |           |        Status: FORFEITED        |
-  | 100% Stake Refunded to Creator  |           | 100% Stake Slashed to Community |
-  | (via emit_transfer)             |           | Treasury Fund                   |
-  +---------------------------------+           +---------------------------------+
+                    +-----------------------------------------------+
+                    |                ATHLETE / USER                 |
+                    +-----------------------------------------------+
+                                           |
+                       1. create_challenge (pledge stake in GEN)
+                          (deadline_timestamp > contract_timestamp)
+                                           v
+                    +-----------------------------------------------+
+                    |        PaceStake Intelligent Contract         |
+                    |           (Status: ACTIVE, Escrowed)          |
+                    |          total_active_staked += stake         |
+                    +-----------------------------------------------+
+                                    /               \
+         (Before deadline: submit proof)             (Past deadline: NO proof submitted)
+                                  /                   \
+                                 v                     v
+    +---------------------------------------+    +---------------------------------------+
+    | 2. submit_proof(evidence_url)         |    | Bounded Terminal Path:                |
+    |    (Status: EVIDENCE_SUBMITTED)       |    | expire_challenge()                    |
+    +---------------------------------------+    +---------------------------------------+
+                        |                                            |
+        3. adjudicate_challenge()                                   v
+                        v                        +---------------------------------------+
+    +---------------------------------------+    | Status: EXPIRED_FORFEITED             |
+    | Decentralized AI Jury Consensus (GenVM)|   | Verdict: "EXPIRED"                    |
+    | - gl.nondet.web.render(url)           |    | total_active_staked -= stake          |
+    | - Strict LLM Security & Metric Audit  |    | treasury_balance += stake             |
+    | - Compare SEMANTIC VERDICT:           |    | stake_amount = 0 (EXACTLY ONCE)       |
+    |   ACHIEVED vs FAILED                  |    +---------------------------------------+
+    +---------------------------------------+
+                   /                         \
+      VERDICT: "ACHIEVED"               VERDICT: "FAILED"
+                  /                           \
+                 v                             v
++---------------------------------+  +---------------------------------+
+| Status: COMPLETED               |  | Status: FORFEITED               |
+| total_active_staked -= stake    |  | total_active_staked -= stake    |
+| 100% Stake Refunded to Creator  |  | 100% Stake Slashed to Community |
+| stake_amount = 0 (EXACTLY ONCE) |  | Treasury Fund                   |
+| (via emit_transfer)             |  | stake_amount = 0 (EXACTLY ONCE) |
++---------------------------------+  +---------------------------------+
 ```
 
 ### Core Workflow:
@@ -65,12 +69,13 @@
      - `athlete_name`: Name registered on athlete's profile / bib.
      - `activity_type`: Sport category (e.g., `RUNNING`, `CYCLING`, `MARATHON`).
      - `target_metric`: Measurable target (e.g., `"Sub-4 Marathon (42.195 km)"`, `"10km under 50 mins"`).
-     - `deadline_timestamp`: Unix timestamp limit.
+     - `deadline_timestamp`: Unix timestamp limit (enforced strictly $> \text{contract\_timestamp}$).
    - Pledges stake in native GEN (must be $\ge$ `min_stake`).
-   - Contract sets challenge status to `ACTIVE`.
+   - Contract sets challenge status to `ACTIVE` and increments `total_active_staked`.
 
-2. **Submit Proof:**
+2. **Submit Proof (Before Deadline):**
    - Once the activity is completed, the athlete submits the public activity URL (`evidence_url`, e.g., Strava activity, Garmin Connect link, or official race results page).
+   - Enforces `current_timestamp <= deadline_timestamp`. Late submissions are rejected.
    - Status updates to `EVIDENCE_SUBMITTED`.
 
 3. **Autonomous AI Adjudication & Semantic Consensus:**
@@ -85,6 +90,14 @@
 4. **Autonomous Settlement:**
    - **`ACHIEVED`**: Status transitions to `COMPLETED`. 100% of the staked GEN is refunded to the athlete via `gl.get_contract_at(creator).emit_transfer(value=u256(stake_amt))`.
    - **`FAILED`**: Status transitions to `FORFEITED`. Staked GEN is permanently slashed into `treasury_balance` (reserved for community incentives, charity, or platform development).
+   - `total_active_staked` is decremented and `stake_amount` zeroed out to prevent double-settlement.
+
+5. **Bounded Expiration Terminal Path (`expire_challenge`):**
+   - If an athlete abandons their commitment and never submits proof before `deadline_timestamp`, the stake is **not** locked forever.
+   - Anyone (permissionless keeper / user / owner) can invoke `expire_challenge(challenge_id)`.
+   - The contract verifies `current_timestamp > deadline_timestamp` using the contract-derived time source (`gl.message.datetime`).
+   - The challenge transitions to `EXPIRED_FORFEITED`.
+   - The stake is transferred to `treasury_balance`, `total_active_staked` is decremented, and `stake_amount` is zeroed out **exactly once**.
 
 ---
 
@@ -103,6 +116,8 @@ This contract is engineered to satisfy the strict requirements of GenVM and GenL
 | **Closure Safety** | Storage values are extracted to local variables (`evidence_url_local`, `athlete_name_local`, etc.) prior to entering `leader_fn`. |
 | **Native Transfer** | Uses `gl.get_contract_at(recipient).emit_transfer(value=u256(amount))` instead of deprecated or non-existent methods. |
 | **Semantic Validator** | Validates `leader_verdict == my_verdict` inside `validator_fn(leader_res)` on `gl.vm.Return.calldata`. |
+| **Contract-Derived Time** | `_get_current_timestamp()` extracts authentic UTC timestamp from `gl.message.datetime` / `gl.message_raw["datetime"]`. |
+| **Bounded Terminal Path** | `expire_challenge()` settles abandoned `ACTIVE` escrows into treasury exactly once with idempotent accounting. |
 
 ---
 
@@ -111,11 +126,11 @@ This contract is engineered to satisfy the strict requirements of GenVM and GenL
 ```
 PaceStake/
 ├── contracts/
-│   └── contract.py            # Main Intelligent Contract in Python
+│   └── contract.py            # Main Intelligent Contract in Python (pure ASCII)
 ├── tests/
 │   ├── __init__.py            # Test package marker
 │   ├── conftest.py            # Simulator RPC mock utility & fixtures (sim_installMocks)
-│   └── test_pacestake.py      # Comprehensive pytest/gltest test suite
+│   └── test_pacestake.py      # Comprehensive pytest/gltest test suite (13 passing tests)
 ├── gltest.config.yaml         # Configuration for gltest (studionet / localnet)
 ├── .env.example               # Template environment variables
 ├── requirements-dev.txt       # Development dependencies
@@ -135,7 +150,7 @@ The test suite covers full happy paths, edge cases, permission boundaries, and f
 pytest tests -v
 ```
 
-### Test Scenarios Covered:
+### Test Scenarios Covered (13/13 Passed):
 1. **Contract Initialization & Default Views:** Verifies initial owner, counters, stake thresholds, and JSON statistics.
 2. **Challenge Creation Security Checks:** Validates minimum stake requirement, empty athlete name, short metric descriptions, and non-positive timestamps.
 3. **Proof Submission Validation:** Enforces access control (only creator), valid HTTP/HTTPS URLs, and prevents double-submissions.
@@ -154,6 +169,10 @@ pytest tests -v
    - Even if raw verdict claims `ACHIEVED`, confidence < 60% triggers automatic fallback to `FAILED`.
 8. **State Machine Integrity:** Enforces that unready or already finalized challenges cannot be re-adjudicated.
 9. **Treasury Management:** Verifies that only the owner can withdraw slashed funds for community/charity purposes.
+10. **Past Deadline Rejection (`test_create_challenge_past_deadline_reverts`):** Proves challenges cannot be registered with past or present deadlines.
+11. **Late Submission Rejection (`test_submit_proof_after_deadline_reverts`):** Proves proof cannot be submitted after the stored deadline lapses.
+12. **Premature Expiration Guard (`test_expire_challenge_before_deadline_reverts`):** Proves `expire_challenge` reverts if invoked before the deadline.
+13. **Bounded Terminal Settlement Exactly Once (`test_expire_challenge_success_and_accounting_exactly_once`):** Proves abandoned active stakes transition to `EXPIRED_FORFEITED`, transfer 100% to treasury, decrement active stake, zero-out stake amount, and reject repeated calls.
 
 ---
 
@@ -163,11 +182,13 @@ PaceStake is deployed and operational on the official GenLayer Studionet environ
 
 | Property | Value |
 |---|---|
-| **Contract Address** | `0x1F4e4FcA9fb50Cd8294b837386436EF66Db0fe91` |
+| **Contract Address** | `0xEF1BC7af4D4e1Edf6260FDC543EA822361e34780` |
 | **Network** | `studionet` |
+| **GenLayer Explorer** | [explorer-studio.genlayer.com/address/0xEF1BC7af4D4e1Edf6260FDC543EA822361e34780](http://explorer-studio.genlayer.com/address/0xEF1BC7af4D4e1Edf6260FDC543EA822361e34780) |
 | **Studio Sandbox URL** | [studio.genlayer.com](https://studio.genlayer.com) |
 | **Compiler / Pragma** | `# v0.2.16` |
 | **Package Dependency** | `py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6` |
+| **Deploy Transaction** | `0xca4beff929c36542e4290b48e9717ced0b5a3fe12c68e35c1ec948eafbc47b99` |
 
 ---
 
