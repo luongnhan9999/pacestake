@@ -1,4 +1,3 @@
-# v0.2.16
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 from genlayer import *
 from dataclasses import dataclass
@@ -9,9 +8,15 @@ try:
 except NameError:
     try:
         from genlayer.gl.vm import UserError
-    except ImportError:
+    except Exception:
         class UserError(Exception):
             pass
+
+try:
+    if not hasattr(gl, "UserError"):
+        gl.UserError = UserError
+except Exception:
+    pass
 
 
 def _addr_str(addr: Address) -> str:
@@ -20,6 +25,17 @@ def _addr_str(addr: Address) -> str:
         return addr.as_hex.lower()
     except Exception:
         return str(addr).lower()
+
+
+def _get_sender() -> Address:
+    """Safely obtain transaction sender across GenVM runtime versions."""
+    try:
+        return gl.message.sender
+    except Exception:
+        try:
+            return gl.message.sender_address
+        except Exception:
+            raise UserError("Cannot resolve sender address.")
 
 
 def _clean_llm_json(text) -> dict:
@@ -70,14 +86,15 @@ class Contract(gl.Contract):
 
     def __init__(self):
         """Initialize PaceStake with standard no-arg constructor."""
-        self.owner = gl.message.sender_address
+        # GenVM auto-initializes TreeMap collections.
+        self.owner = _get_sender()
         self.next_challenge_id = bigint(1)
         self.min_stake = bigint(500)
         self.treasury_balance = bigint(0)
         self.total_active_staked = bigint(0)
 
     def _get_current_timestamp(self) -> bigint:
-        """Derive trusted execution timestamp from GenLayer transaction context."""
+        """Derive trusted deterministic execution timestamp from GenLayer transaction context."""
         try:
             from datetime import datetime
             dt_raw = getattr(gl.message, "datetime", None)
@@ -91,6 +108,7 @@ class Contract(gl.Contract):
                     return bigint(ts)
         except Exception:
             pass
+
         try:
             if hasattr(gl, "block") and hasattr(gl.block, "timestamp"):
                 ts = int(gl.block.timestamp)
@@ -98,6 +116,7 @@ class Contract(gl.Contract):
                     return bigint(ts)
         except Exception:
             pass
+
         return bigint(0)
 
     @gl.public.write.payable
@@ -138,7 +157,7 @@ class Contract(gl.Contract):
 
         challenge = FitnessChallenge(
             id=cid,
-            creator=gl.message.sender_address,
+            creator=_get_sender(),
             athlete_name=athlete_name,
             activity_type=activity_type,
             target_metric=target_metric,
@@ -162,7 +181,7 @@ class Contract(gl.Contract):
             raise UserError("Challenge not found")
 
         challenge = self.challenges[challenge_id]
-        sender_hex = _addr_str(gl.message.sender_address)
+        sender_hex = _addr_str(_get_sender())
         creator_hex = _addr_str(challenge.creator)
 
         if sender_hex != creator_hex:
@@ -327,7 +346,7 @@ Output strict JSON only:
             challenge.status = "COMPLETED"
             challenge.stake_amount = bigint(0)
             self.challenges[challenge_id] = challenge
-            gl.get_contract_at(creator_addr).emit_transfer(value=u256(stake_amt))
+            gl.get_contract_at(creator_addr).emit_transfer(value=u256(int(stake_amt)))
         else:
             challenge.status = "FORFEITED"
             challenge.stake_amount = bigint(0)
@@ -347,7 +366,10 @@ Output strict JSON only:
             )
 
         now_ts = self._get_current_timestamp()
-        if now_ts > bigint(0) and now_ts <= challenge.deadline_timestamp:
+        if now_ts <= bigint(0):
+            raise UserError("Cannot verify deadline: contract runtime timestamp is unavailable.")
+
+        if now_ts <= challenge.deadline_timestamp:
             raise UserError(
                 f"Challenge deadline has not passed yet (deadline: {challenge.deadline_timestamp}, current: {now_ts})"
             )
@@ -376,7 +398,7 @@ Output strict JSON only:
     @gl.public.write
     def withdraw_treasury(self, recipient: str, amount: int) -> None:
         """Allow contract owner to withdraw forfeited stakes for sports charities / community rewards."""
-        sender_hex = _addr_str(gl.message.sender_address)
+        sender_hex = _addr_str(_get_sender())
         owner_hex = _addr_str(self.owner)
         if sender_hex != owner_hex:
             raise UserError("Only owner can withdraw treasury funds")
@@ -390,12 +412,12 @@ Output strict JSON only:
 
         recipient_addr = Address(recipient)
         self.treasury_balance -= amt
-        gl.get_contract_at(recipient_addr).emit_transfer(value=u256(amt))
+        gl.get_contract_at(recipient_addr).emit_transfer(value=u256(int(amt)))
 
     @gl.public.write
     def set_min_stake(self, new_min_stake: int) -> None:
         """Allow contract owner to update the minimum required stake."""
-        sender_hex = _addr_str(gl.message.sender_address)
+        sender_hex = _addr_str(_get_sender())
         owner_hex = _addr_str(self.owner)
         if sender_hex != owner_hex:
             raise UserError("Only owner can set min stake")
@@ -463,4 +485,3 @@ Output strict JSON only:
     def get_current_time(self) -> int:
         """Retrieve current contract-derived execution timestamp."""
         return int(str(self._get_current_timestamp()))
-
