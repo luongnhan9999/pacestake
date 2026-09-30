@@ -76,6 +76,30 @@ class Contract(gl.Contract):
         self.treasury_balance = bigint(0)
         self.total_active_staked = bigint(0)
 
+    def _get_current_timestamp(self) -> bigint:
+        """Derive trusted execution timestamp from GenLayer transaction context."""
+        try:
+            from datetime import datetime
+            dt_raw = getattr(gl.message, "datetime", None)
+            if dt_raw is None and hasattr(gl, "message_raw") and isinstance(gl.message_raw, dict):
+                dt_raw = gl.message_raw.get("datetime")
+            if dt_raw:
+                dt_str = str(dt_raw).strip().replace("Z", "+00:00")
+                dt = datetime.fromisoformat(dt_str)
+                ts = int(dt.timestamp())
+                if ts > 0:
+                    return bigint(ts)
+        except Exception:
+            pass
+        try:
+            if hasattr(gl, "block") and hasattr(gl.block, "timestamp"):
+                ts = int(gl.block.timestamp)
+                if ts > 0:
+                    return bigint(ts)
+        except Exception:
+            pass
+        return bigint(0)
+
     @gl.public.write.payable
     def create_challenge(
         self,
@@ -104,6 +128,10 @@ class Contract(gl.Contract):
         if deadline_timestamp <= 0:
             raise UserError("Deadline timestamp must be positive")
 
+        now_ts = self._get_current_timestamp()
+        if now_ts > bigint(0) and bigint(deadline_timestamp) <= now_ts:
+            raise UserError(f"Deadline must be strictly in the future (current timestamp: {now_ts})")
+
         cid = str(self.next_challenge_id)
         self.next_challenge_id += bigint(1)
         self.total_active_staked += stake
@@ -121,7 +149,7 @@ class Contract(gl.Contract):
             verdict="PENDING",
             confidence=bigint(0),
             reason="Challenge created. Awaiting activity completion and proof submission.",
-            created_at=bigint(1),
+            created_at=now_ts if now_ts > bigint(0) else bigint(1),
         )
 
         self.challenges[cid] = challenge
@@ -142,6 +170,12 @@ class Contract(gl.Contract):
 
         if challenge.status != "ACTIVE":
             raise UserError(f"Cannot submit proof for challenge with status '{challenge.status}'")
+
+        now_ts = self._get_current_timestamp()
+        if now_ts > bigint(0) and now_ts > challenge.deadline_timestamp:
+            raise UserError(
+                f"Challenge deadline has passed (deadline: {challenge.deadline_timestamp}, current: {now_ts}). Proof can no longer be submitted."
+            )
 
         url = evidence_url.strip()
         if not (url.startswith("http://") or url.startswith("https://")):
@@ -291,12 +325,53 @@ Output strict JSON only:
 
         if verdict == "ACHIEVED":
             challenge.status = "COMPLETED"
+            challenge.stake_amount = bigint(0)
             self.challenges[challenge_id] = challenge
             gl.get_contract_at(creator_addr).emit_transfer(value=u256(stake_amt))
         else:
             challenge.status = "FORFEITED"
+            challenge.stake_amount = bigint(0)
             self.treasury_balance += stake_amt
             self.challenges[challenge_id] = challenge
+
+    @gl.public.write
+    def expire_challenge(self, challenge_id: str) -> None:
+        """Bounded terminal path: Settle an ACTIVE challenge that lapsed past deadline without proof submission."""
+        if challenge_id not in self.challenges:
+            raise UserError("Challenge not found")
+
+        challenge = self.challenges[challenge_id]
+        if challenge.status != "ACTIVE":
+            raise UserError(
+                f"Cannot expire challenge with status '{challenge.status}'. Only 'ACTIVE' challenges can be expired."
+            )
+
+        now_ts = self._get_current_timestamp()
+        if now_ts > bigint(0) and now_ts <= challenge.deadline_timestamp:
+            raise UserError(
+                f"Challenge deadline has not passed yet (deadline: {challenge.deadline_timestamp}, current: {now_ts})"
+            )
+
+        stake_amt = challenge.stake_amount
+        if stake_amt <= bigint(0):
+            raise UserError("Challenge stake has already been settled")
+
+        # Update active stake accounting exactly once
+        if self.total_active_staked >= stake_amt:
+            self.total_active_staked -= stake_amt
+        else:
+            self.total_active_staked = bigint(0)
+
+        # Forfeit stake into protocol treasury
+        self.treasury_balance += stake_amt
+
+        # Update challenge to terminal expired state and zero out stake
+        challenge.stake_amount = bigint(0)
+        challenge.status = "EXPIRED_FORFEITED"
+        challenge.verdict = "EXPIRED"
+        challenge.confidence = bigint(100)
+        challenge.reason = "Challenge expired without proof submission before deadline. Stake forfeited to treasury."
+        self.challenges[challenge_id] = challenge
 
     @gl.public.write
     def withdraw_treasury(self, recipient: str, amount: int) -> None:
@@ -383,3 +458,9 @@ Output strict JSON only:
     @gl.public.view
     def get_owner(self) -> str:
         return _addr_str(self.owner)
+
+    @gl.public.view
+    def get_current_time(self) -> int:
+        """Retrieve current contract-derived execution timestamp."""
+        return int(str(self._get_current_timestamp()))
+
