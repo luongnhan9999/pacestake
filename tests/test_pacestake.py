@@ -401,3 +401,127 @@ def test_withdraw_treasury(direct_vm, direct_deploy, direct_owner, direct_bob, d
     contract.withdraw_treasury(_to_hex(direct_charlie), 2000)
     assert contract.get_treasury_balance() == 1000
     assert direct_vm._balances.get(charlie_bytes, 0) == 2000
+
+
+def test_create_challenge_past_deadline_reverts(direct_vm, direct_deploy, direct_owner, direct_bob):
+    """Verify challenge cannot be created with a deadline in the past or present."""
+    setup_post_message_hook(direct_vm)
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/contract.py")
+
+    # Set virtual block datetime to 2026-06-01T12:00:00Z (timestamp 1780315200)
+    direct_vm.warp("2026-06-01T12:00:00Z")
+    current_ts = contract.get_current_time()
+    assert current_ts > 0
+
+    direct_vm.sender = direct_bob
+    direct_vm.value = 1000
+
+    # Attempt to create with deadline equal to or earlier than current timestamp
+    with pytest.raises(Exception) as excinfo:
+        contract.create_challenge("Bob", "RUNNING", "10k run", current_ts - 100)
+    assert "Deadline must be strictly in the future" in str(excinfo.value)
+
+    with pytest.raises(Exception) as excinfo:
+        contract.create_challenge("Bob", "RUNNING", "10k run", current_ts)
+    assert "Deadline must be strictly in the future" in str(excinfo.value)
+
+
+def test_submit_proof_after_deadline_reverts(direct_vm, direct_deploy, direct_owner, direct_bob):
+    """Verify proof cannot be submitted after the stored deadline has passed."""
+    setup_post_message_hook(direct_vm)
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/contract.py")
+
+    # Start at 2026-06-01T10:00:00Z
+    direct_vm.warp("2026-06-01T10:00:00Z")
+    now_ts = contract.get_current_time()
+    deadline = now_ts + 3600  # 1 hour deadline
+
+    direct_vm.sender = direct_bob
+    direct_vm.value = 2000
+    cid = contract.create_challenge("Bob", "RUNNING", "Half Marathon", deadline)
+    direct_vm.value = 0
+
+    # Warp past deadline (1 hour + 5 minutes later)
+    direct_vm.warp("2026-06-01T11:05:00Z")
+    assert contract.get_current_time() > deadline
+
+    # Attempt to submit proof after deadline
+    with pytest.raises(Exception) as excinfo:
+        contract.submit_proof(cid, "https://strava.com/activities/late-submission")
+    assert "Challenge deadline has passed" in str(excinfo.value)
+
+
+def test_expire_challenge_before_deadline_reverts(direct_vm, direct_deploy, direct_owner, direct_bob, direct_charlie):
+    """Verify expire_challenge cannot be invoked before the deadline has elapsed."""
+    setup_post_message_hook(direct_vm)
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/contract.py")
+
+    direct_vm.warp("2026-06-01T10:00:00Z")
+    now_ts = contract.get_current_time()
+    deadline = now_ts + 7200  # 2 hours deadline
+
+    direct_vm.sender = direct_bob
+    direct_vm.value = 1500
+    cid = contract.create_challenge("Bob", "RUNNING", "15k run", deadline)
+    direct_vm.value = 0
+
+    # Advance time, but still before deadline (1 hour later)
+    direct_vm.warp("2026-06-01T11:00:00Z")
+
+    # Charlie (or anyone) attempts to expire before deadline
+    direct_vm.sender = direct_charlie
+    with pytest.raises(Exception) as excinfo:
+        contract.expire_challenge(cid)
+    assert "Challenge deadline has not passed yet" in str(excinfo.value)
+
+
+def test_expire_challenge_success_and_accounting_exactly_once(direct_vm, direct_deploy, direct_owner, direct_bob, direct_charlie):
+    """Verify bounded terminal path settles abandoned stake and updates accounting exactly once."""
+    setup_post_message_hook(direct_vm)
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/contract.py")
+
+    direct_vm.warp("2026-06-01T10:00:00Z")
+    now_ts = contract.get_current_time()
+    deadline = now_ts + 3600  # 1 hour deadline
+
+    initial_treasury = contract.get_treasury_balance()
+    initial_active = contract.get_total_active_staked()
+
+    # Bob creates challenge pledging 4,000 wei
+    direct_vm.sender = direct_bob
+    direct_vm.value = 4000
+    cid = contract.create_challenge("Bob", "CYCLING", "Century 100km", deadline)
+    direct_vm.value = 0
+
+    assert contract.get_total_active_staked() == initial_active + 4000
+    assert contract.get_treasury_balance() == initial_treasury
+
+    # Bob NEVER submits proof. Deadline passes. Warp 2 hours into future.
+    direct_vm.warp("2026-06-01T12:00:00Z")
+    assert contract.get_current_time() > deadline
+
+    # Charlie (or any keeper/user) triggers bounded terminal path
+    direct_vm.sender = direct_charlie
+    contract.expire_challenge(cid)
+
+    # Verify state and single accounting update
+    challenge_data = json.loads(contract.get_challenge(cid))
+    assert challenge_data["status"] == "EXPIRED_FORFEITED"
+    assert challenge_data["verdict"] == "EXPIRED"
+    assert challenge_data["confidence"] == 100
+    assert int(challenge_data["stake_amount"]) == 0
+    assert "Challenge expired without proof submission" in challenge_data["reason"]
+
+    # Accounting assertions: active stake decreased, treasury increased by exactly 4,000 wei
+    assert contract.get_total_active_staked() == initial_active
+    assert contract.get_treasury_balance() == initial_treasury + 4000
+
+    # Verify IDEMPOTENCY / EXACTLY ONCE: Attempting to expire again must fail
+    with pytest.raises(Exception) as excinfo:
+        contract.expire_challenge(cid)
+    assert "Cannot expire challenge with status 'EXPIRED_FORFEITED'" in str(excinfo.value)
+
