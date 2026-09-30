@@ -182,13 +182,12 @@ PaceStake is deployed and operational on the official GenLayer Studionet environ
 
 | Property | Value |
 |---|---|
-| **Contract Address** | `0xEF1BC7af4D4e1Edf6260FDC543EA822361e34780` |
+| **Contract Address** | `0xf48ecd73bB01337226fAd71a59c159b2Ff0901b0` |
+| **Owner / Deployer** | `0x52c5e913fc54d00cba5df3312268bf66035661f8` |
 | **Network** | `studionet` |
-| **GenLayer Explorer** | [explorer-studio.genlayer.com/address/0xEF1BC7af4D4e1Edf6260FDC543EA822361e34780](http://explorer-studio.genlayer.com/address/0xEF1BC7af4D4e1Edf6260FDC543EA822361e34780) |
+| **GenLayer Explorer** | [explorer-studio.genlayer.com/address/0xf48ecd73bB01337226fAd71a59c159b2Ff0901b0](http://explorer-studio.genlayer.com/address/0xf48ecd73bB01337226fAd71a59c159b2Ff0901b0) |
 | **Studio Sandbox URL** | [studio.genlayer.com](https://studio.genlayer.com) |
-| **Compiler / Pragma** | `# v0.2.16` |
 | **Package Dependency** | `py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6` |
-| **Deploy Transaction** | `0xca4beff929c36542e4290b48e9717ced0b5a3fe12c68e35c1ec948eafbc47b99` |
 
 ---
 
